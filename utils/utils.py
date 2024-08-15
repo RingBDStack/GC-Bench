@@ -6,19 +6,18 @@ import torch
 import torch.nn as nn
 import random
 import torch_geometric.transforms as T
-from ogb.nodeproppred import PygNodePropPredDataset, Evaluator
+# from ogb.nodeproppred import PygNodePropPredDataset
 from deeprobust.graph.data import Dataset
 from deeprobust.graph.utils import get_train_val_test
-from torch_geometric.utils import train_test_split_edges
 from sklearn.model_selection import train_test_split
 from sklearn import metrics
 import numpy as np
 import torch.nn.functional as F
 from sklearn.preprocessing import StandardScaler
 from deeprobust.graph.utils import *
-from torch_geometric.data import NeighborSampler
+from torch_geometric.data import NeighborSampler, HeteroData
 from torch_geometric.utils import add_remaining_self_loops, to_undirected
-from torch_geometric.datasets import Planetoid, WebKB, WikipediaNetwork
+from torch_geometric.datasets import Planetoid, WebKB, WikipediaNetwork,IMDB, HGBDataset
 import math
 import torch.nn.functional as F
 from torch_geometric.utils import add_self_loops
@@ -36,9 +35,13 @@ def get_dataset(
     else:
         path = osp.join(dataset_dir)
     if name in ["cora", "citeseer", "pubmed"]:
-        dataset = Planetoid(root=path, name=name)
-    elif name in ["ogbn-arxiv"]:
-        dataset = PygNodePropPredDataset(name="ogbn-arxiv")
+        dataset = Planetoid(path, name)
+    elif name in ["IMDB"]:
+        dataset = IMDB(root=f'{path}/{name}')
+    elif name in ['imdb']:
+        dataset = HGBDataset(root=f'{path}/{name}', name=name)
+    # elif name in ["ogbn-arxiv"]:
+    #     dataset = PygNodePropPredDataset(name="ogbn-arxiv")
     elif name in ['cornell', 'texas', 'wisconsin']:
         dataset = WebKB(path, name)
     elif name in ['chameleon', 'squirrel']:
@@ -53,7 +56,7 @@ def get_dataset(
     elif transform is not None:
         dataset.transform = transform
 
-    dpr_data = Pyg2Dpr(dataset)
+    dpr_data = Pyg2Dpr(dataset, dataset_name=name)
     if name in ["ogbn-arxiv"]:
         # the features are different from the features provided by GraphSAINT
         # normalize features, following graphsaint
@@ -68,51 +71,99 @@ def get_dataset(
 
 
 class Pyg2Dpr(Dataset):
-    def __init__(self, pyg_data, **kwargs):
+    def __init__(self, pyg_data, dataset_name=None, **kwargs):
         try:
             splits = pyg_data.get_idx_split()
         except:
             pass
-
-        dataset_name = pyg_data.name
+        if dataset_name is None:
+            dataset_name = pyg_data.name
         pyg_data = pyg_data[0]
         n = pyg_data.num_nodes
-
-        if dataset_name == "ogbn-arxiv":  # symmetrization
-            pyg_data.edge_index = to_undirected(pyg_data.edge_index, pyg_data.num_nodes)
-
-        self.adj = sp.csr_matrix(
-            (
-                np.ones(pyg_data.edge_index.shape[1]),
-                (pyg_data.edge_index[0], pyg_data.edge_index[1]),
-            ),
-            shape=(n, n),
-        )
-
-        self.features = pyg_data.x.numpy()
-        self.labels = pyg_data.y.numpy()
-
-        if len(self.labels.shape) == 2 and self.labels.shape[1] == 1:
-            self.labels = self.labels.reshape(-1)  # ogb-arxiv needs to reshape
-
-        if hasattr(pyg_data, "train_mask"):
-            # for fixed split
-            self.idx_train = mask_to_index(pyg_data.train_mask, n)
-            self.idx_val = mask_to_index(pyg_data.val_mask, n)
-            self.idx_test = mask_to_index(pyg_data.test_mask, n)
-            self.name = "Pyg2Dpr"
-        else:
-            try:
-                # for ogb
-                self.idx_train = splits["train"]
-                self.idx_val = splits["valid"]
-                self.idx_test = splits["test"]
-                self.name = "Pyg2Dpr"
-            except:
-                # for other datasets
-                self.idx_train, self.idx_val, self.idx_test = get_train_val_test(
-                    nnodes=n, val_size=0.1, test_size=0.8, stratify=self.labels
+        
+        if isinstance(pyg_data, HeteroData):
+            features = []
+            edge_index_list = []
+            labels = []
+            node_offset = 0
+            for node_type in pyg_data.node_types:
+                if hasattr(pyg_data[node_type], 'x'):
+                    features.append(pyg_data[node_type].x.numpy())
+                else:
+                    features.append(np.eye(pyg_data[node_type].num_nodes))
+                if 'y' in pyg_data[node_type]:
+                    n_target = pyg_data[node_type].num_nodes
+                    dim_target = pyg_data[node_type].x.shape[1]
+                    labels.append(pyg_data[node_type].y.numpy())
+                    self.idx_train = mask_to_index(pyg_data[node_type].train_mask, n_target)
+                    if hasattr(pyg_data[node_type], 'val_mask'):
+                        self.idx_val = mask_to_index(pyg_data[node_type].val_mask, n_target)
+                    else:
+                        self.idx_val = np.array([], dtype=np.int64)
+                    self.idx_test = mask_to_index(pyg_data[node_type].test_mask, n_target)
+                    self.name = "Pyg2Dpr"
+                # else:
+                #     labels.append(-1 * np.ones(pyg_data[node_type].x.shape[0], dtype=int))
+                num_nodes = pyg_data[node_type].num_nodes
+                node_offset += num_nodes
+            # max_size = max(feature.shape[1] for feature in features)
+            padded_features = [
+            np.pad(feature[:, :dim_target], 
+                    ((0, 0), (0, max(0, dim_target - feature.shape[1]))), 
+                    mode='constant')
+                for feature in features
+            ]
+            self.features = np.concatenate(padded_features, axis=0)
+            adj_data = []
+            for edge_type in pyg_data.edge_types:
+                edge_index = pyg_data[edge_type].edge_index
+                adj_data.append(
+                    (
+                        np.ones(edge_index.size(1)),
+                        (edge_index[0].numpy(), edge_index[1].numpy()),
+                    )
                 )
+            row = np.concatenate([data[1][0] for data in adj_data])
+            col = np.concatenate([data[1][1] for data in adj_data])
+            data = np.concatenate([data[0] for data in adj_data])
+            self.labels = np.concatenate(labels)
+            self.adj = sp.csr_matrix((data, (row, col)), shape=(n, n))
+        else:
+            if dataset_name == "ogbn-arxiv":  # symmetrization
+                pyg_data.edge_index = to_undirected(pyg_data.edge_index, pyg_data.num_nodes)
+
+            self.adj = sp.csr_matrix(
+                (
+                    np.ones(pyg_data.edge_index.shape[1]),
+                    (pyg_data.edge_index[0], pyg_data.edge_index[1]),
+                ),
+                shape=(n, n),
+            )
+
+            self.features = pyg_data.x.numpy()
+            self.labels = pyg_data.y.numpy()
+
+            if len(self.labels.shape) == 2 and self.labels.shape[1] == 1:
+                self.labels = self.labels.reshape(-1)  # ogb-arxiv needs to reshape
+
+            if hasattr(pyg_data, "train_mask"):
+                # for fixed split
+                self.idx_train = mask_to_index(pyg_data.train_mask, n)
+                self.idx_val = mask_to_index(pyg_data.val_mask, n)
+                self.idx_test = mask_to_index(pyg_data.test_mask, n)
+                self.name = "Pyg2Dpr"
+            else:
+                try:
+                    # for ogb
+                    self.idx_train = splits["train"]
+                    self.idx_val = splits["valid"]
+                    self.idx_test = splits["test"]
+                    self.name = "Pyg2Dpr"
+                except:
+                    # for other datasets
+                    self.idx_train, self.idx_val, self.idx_test = get_train_val_test(
+                        nnodes=n, val_size=0.1, test_size=0.8, stratify=self.labels
+                    )
 
 
 def mask_to_index(index, size, split_choice=0):
@@ -311,7 +362,6 @@ class Transd2Ind:
             return np.array(node_idx).reshape(-1)
 
 
-
 def init_feat(feat_syn, args, data, syn_class_indices, transductive=True):      
     feature_init = {}   
     for c in range(data.nclass):
@@ -347,7 +397,6 @@ def init_feat_c(nnodes_syn, feat_real, method):
     else:
         feature_init = None
     return feature_init
-
 
 
 def match_loss(gw_syn, gw_real, args, device):
@@ -676,6 +725,7 @@ def training_scheduler(lam, t, T, scheduler="geom"):
     elif scheduler == "geom":
         return min(1, 2 ** (math.log2(lam) - math.log2(lam) * t / T))
 
+
 def get_loops(args):
     # Get the two hyper-parameters of outer-loop and inner-loop.
     # The following values are empirically good.
@@ -693,3 +743,17 @@ def get_loops(args):
         return 20, 10
     else:
         return 20, 10
+
+
+def fair_metric(pred, labels, sens):
+    idx_s0 = sens == 0
+    idx_s1 = sens == 1
+    labels = labels.cpu().numpy()
+    idx_s0_y1 = np.bitwise_and(idx_s0, labels == 1)
+    idx_s1_y1 = np.bitwise_and(idx_s1, labels == 1)
+    parity = abs(sum(pred[idx_s0]) / sum(idx_s0) - sum(pred[idx_s1]) / sum(idx_s1))
+    equality = abs(
+        sum(pred[idx_s0_y1]) / sum(idx_s0_y1) - sum(pred[idx_s1_y1]) / sum(idx_s1_y1)
+    )
+    return parity.item(), equality.item()
+

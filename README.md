@@ -29,15 +29,19 @@ To get started with GC-Bench, please follow the instructions below:
    conda env create -f environment.yml
 
 2. **Download Datasets**
-   Download the datasets and store them in the `data` directory. The project structure should look like the following:
+   Download the node classification and graph classification datasets and store them in the specified directory. By default, this is the data directory, but you can customize it by changing the `data_dir` parameter in your configuration. The project structure should look like the following:
+
    ```bash
    GC-Bench
-   ├── data
-   │   ├── cora
-   │   ├── citeseer
-   │   └── ...
-   └── DM
-   └── ...
+      ├── data
+      │   ├── cora
+      │   ├── citeseer
+      │   └── ...
+      └── DM
+      └── ...
+   ```
+
+   Alternatively, you can leverage [PyG](https://pytorch-geometric.readthedocs.io/en/latest/) to download and manage these datasets directly, eliminating the need to manually place them in the data directory.
 
 ## Condense Graph Datasets
 
