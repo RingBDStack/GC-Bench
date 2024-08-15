@@ -29,6 +29,7 @@ To get started with GC-Bench, please follow the instructions below:
    conda env create -f environment.yml
 
 2. **Download Datasets**
+   
    Download the node classification and graph classification datasets and store them in the specified directory. By default, this is the data directory, but you can customize it by changing the `data_dir` parameter in your configuration. The project structure should look like the following:
 
    ```bash
